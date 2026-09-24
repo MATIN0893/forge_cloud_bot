@@ -1,9 +1,10 @@
 import os
-import asyncio
 import logging
-from aiohttp import web
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from groq import Groq
@@ -19,38 +20,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Environment variables (no secrets in code)
+# Environment variables (no hard‑coded secrets)
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-PORT = int(os.getenv("PORT", "8080"))
+TELEGRAM_BOT_TOKEN: Optional[str] = os.getenv("FORGE_CLOUD_BOT_TOKEN")
+GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
+GITHUB_TOKEN: Optional[str] = os.getenv("GITHUB_TOKEN")
 
 # ---------------------------------------------------------------------------
-# External service clients (initialized only if keys are present)
+# External service clients – created lazily when the corresponding token exists
 # ---------------------------------------------------------------------------
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-github_client = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+github_client: Optional[Github] = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
 # ---------------------------------------------------------------------------
-# Bot command handlers
+# Telegram command handlers
 # ---------------------------------------------------------------------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report service status, Groq model connection and GitHub connectivity."""
     gh_status = "Подключен" if github_client else "Отключен (нет токена)"
     groq_status = (
         "Подключен (llama-3.1-8b-instant)" if groq_client else "Отключен"
     )
     text = (
         "⚒️ **MATIN FORGE CLOUD В СТРОЮ!**\n\n"
-        f"• 🌐 Хост: Render (24/7 Web Server)\n"
+        f"• 🌐 Хост: FastAPI (async)\n"
         f"• 🧠 Модель: {groq_status}\n"
         f"• 🐙 GitHub: {gh_status}\n"
-        "• ⚡️ Статус: Активен, защита от сбоев включена\n"
-        "• 📦 Команды: /repos, /ask <вопрос>, /status"
+        "• ⚡️ Статус: Активен\n"
+        "• 📦 Команды: /repos, /ask <вопрос>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def repos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return first 10 repositories of the authenticated GitHub user."""
     if not github_client:
         await update.message.reply_text(
             "❌ Ошибка: GITHUB_TOKEN не задан в переменных окружения."
@@ -60,18 +62,16 @@ async def repos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = github_client.get_user()
         repos = [f"• {repo.name}" for repo in user.get_repos()[:10]]
         if not repos:
-            repos_text = "_Нет публичных репозиториев_"
+            reply = "📦 У вас нет публичных репозиториев."
         else:
-            repos_text = "\n".join(repos)
-        await update.message.reply_text(
-            f"📦 **Твои репозитории на GitHub:**\n{repos_text}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            reply = "📦 **Твои репозитории на GitHub:**\n" + "\n".join(repos)
+        await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception as exc:
-        logger.exception("Failed to fetch GitHub repositories")
+        logger.exception("Error while fetching GitHub repos")
         await update.message.reply_text(f"❌ Ошибка получения репозиториев: {exc}")
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a prompt to Groq Llama‑3.1‑8b‑instant model and return the answer."""
     prompt = " ".join(context.args)
     if not prompt:
         await update.message.reply_text("ℹ️ Использование: /ask <твой запрос>")
@@ -86,8 +86,8 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 {
                     "role": "system",
                     "content": (
-                        "Ты MATIN FORGE CLOUD — облачный архитектор и инженер системы MATIN BRAIN CORE. "
-                        "Отвечай технически точно и лаконично."
+                        "Ты MATIN FORGE CLOUD — облачный инженер системы MATIN BRAIN CORE. "
+                        "Отвечай кратко и строго по делу."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -96,74 +96,57 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         answer = completion.choices[0].message.content
         await update.message.reply_text(answer)
     except Exception as exc:
-        logger.exception("Groq generation failed")
+        logger.exception("Error while calling Groq API")
         await update.message.reply_text(f"❌ Ошибка генерации: {exc}")
 
 # ---------------------------------------------------------------------------
-# aiohttp web server (для Render keep‑alive)
+# FastAPI application with lifespan that starts/stops the Telegram bot
 # ---------------------------------------------------------------------------
-async def health_check(request: web.Request) -> web.Response:
-    return web.Response(text="OK - MATIN FORGE CLOUD ALIVE", status=200)
+app = FastAPI()
 
-async def start_web_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    logger.info(f"Web server started on port {PORT}")
-    return runner
+tg_app: Optional[Application] = None
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global tg_app
+    if TELEGRAM_BOT_TOKEN:
+        request_config = HTTPXRequest(
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=30.0,
+        )
+        tg_app = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .request(request_config)
+            .build()
+        )
+        tg_app.add_handler(CommandHandler("status", status_cmd))
+        tg_app.add_handler(CommandHandler("repos", repos_cmd))
+        tg_app.add_handler(CommandHandler("ask", ask_cmd))
+
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("⚒️ Telegram бот запущен внутри FastAPI")
+    else:
+        logger.warning("⚠️ Токен бота не найден в переменных окружения (FORGE_CLOUD_BOT_TOKEN)")
+
+    yield
+
+    if tg_app:
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
+        logger.info("🛑 Telegram бот корректно остановлен")
+
+app.router.lifespan_context = lifespan
 
 # ---------------------------------------------------------------------------
-# Bot initialization and run logic
+# Health endpoints
 # ---------------------------------------------------------------------------
-async def run_bot() -> None:
-    # HTTPX request configuration for Telegram API
-    request_config = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request_config)
-        .build()
-    )
-
-    # Register command handlers
-    application.add_handler(CommandHandler("status", status_cmd))
-    application.add_handler(CommandHandler("repos", repos_cmd))
-    application.add_handler(CommandHandler("ask", ask_cmd))
-
-    # Run the bot (polling mode). This coroutine returns only when stopped.
-    await application.run_polling(drop_pending_updates=True)
-
-# ---------------------------------------------------------------------------
-# Main entry point with auto‑restart
-# ---------------------------------------------------------------------------
-async def main() -> None:
-    while True:
-        runner: web.AppRunner | None = None
-        try:
-            runner = await start_web_server()
-            await run_bot()
-        except Exception as exc:
-            logger.exception("Unexpected error in bot runtime, restarting in 5 seconds")
-            await asyncio.sleep(5)
-        finally:
-            if runner:
-                await runner.cleanup()
-                logger.info("Web server stopped")
-            # Small pause before next restart attempt to avoid tight loop
-            await asyncio.sleep(1)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped by user")
+@app.get("/")
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "service": "MATIN FORGE CLOUD"}
