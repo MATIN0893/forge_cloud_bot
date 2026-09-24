@@ -1,5 +1,6 @@
-python-telegram-bot>=20
-aiohttp
+fastapi
+uvicorn[standard]
+python-telegram-bot
+httpx
 groq
 PyGithub
-python-dotenv
